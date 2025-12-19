@@ -23,14 +23,16 @@ class BuyView(discord.ui.View):
         buyer = interaction.user
         
         async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            cursor = await db.execute("SELECT item_id, price, seller_id, status FROM market_items WHERE thread_id = ?", (thread_id,))
+            cursor = await db.execute("SELECT item_id, price, seller_id, status, image_url, tags FROM market_items WHERE thread_id = ?", (thread_id,))
             row = await cursor.fetchone()
             
             if not row:
                 await interaction.response.send_message("❌ データが見つかりません。", ephemeral=True)
                 return
             
-            item_id, price, seller_id, status = row
+            item_id, price, seller_id, status, img_url, tags_str = row
+            img_url = img_url or ""
+            tags_str = tags_str or ""
             
             if status != 'on_sale':
                 await interaction.response.send_message("❌ 売り切れです。", ephemeral=True)
@@ -80,14 +82,6 @@ class BuyView(discord.ui.View):
                 # 1. Log to shadow-logs
                 log_channel = discord.utils.get(interaction.guild.text_channels, name="shadow-logs")
                 if log_channel:
-                    img_url = ""
-                    # We need image url from somewhere, fetch from DB or message
-                    # Let's fetch from DB for logging
-                    async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db_log:
-                        c2 = await db_log.execute("SELECT image_url, tags, aesthetic_score FROM market_items WHERE item_id = ?", (item_id,))
-                        r2 = await c2.fetchone()
-                        img_url = r2[0] if r2 else ""
-                        tags_str = r2[1] if r2 else ""
 
                     log_embed = discord.Embed(title="💸 Transaction Log", color=discord.Color.green())
                     log_embed.add_field(name="Item ID", value=f"#{item_id}", inline=True)
