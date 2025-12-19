@@ -38,55 +38,18 @@ class StockOrderModal(discord.ui.Modal, title="注文入力"):
             amount = int(self.amount_input.value)
             if amount <= 0: raise ValueError
         except:
-             await interaction.response.send_message("❌ 正しい数量を入力してください。", ephemeral=True)
+             await interaction.response.send_message(f"❌ 正しい数量を入力してください。", ephemeral=True)
              return
 
-        async with aiosqlite.connect(self.bot.bank.db_path) as db:
-            # 1. Get Current Price
-            cursor = await db.execute("SELECT current_price FROM tag_stocks WHERE tag_name = ?", (self.tag_name,))
-            row = await cursor.fetchone()
-            if not row:
-                current_price = 100.0 # Default fallback
-            else:
-                current_price = row[0]
-            
-            total_cost = int(current_price * amount)
-            
-            if self.order_type == "buy":
-                # Buy Logic
-                try:
-                    await self.bot.bank.withdraw_credits(interaction.user, total_cost)
-                except ValueError:
-                    await interaction.response.send_message(f"❌ 残高不足です (必要: {total_cost:,} Credits)", ephemeral=True)
-                    return
-                
-                # Update User/Tag Stocks
-                await db.execute("""
-                    INSERT INTO user_stocks (user_id, tag_name, amount, average_cost) 
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(user_id, tag_name) DO UPDATE SET 
-                        average_cost = ((average_cost * amount) + (? * ?)) / (amount + ?),
-                        amount = amount + ?
-                """, (interaction.user.id, self.tag_name, amount, total_cost, total_cost, amount, amount, amount)) # Wait, avg cost logic is flawed here.
-                # Re-do Avg Cost: (OldAvg * OldAmt + NewPrice * NewAmt) / (OldAmt + NewAmt)
-                # It's hard to do pure SQL for weighted average properly with upsert.
-                # Better to Select -> Calc -> Update.
-                
-                # Let's fix the buy logic properly
-                pass 
-                
-            elif self.order_type == "sell":
-                 # Checking valid logic later
-                 pass
-
-        # Use helper method in Cog for cleaner implementation
-        # Re-dispatch to command like logic? No, let's keep it here but refactor.
+        # Delegate to Cog
         cog = self.bot.get_cog("StocksCog")
         if cog:
             if self.order_type == "buy":
                 await cog.process_buy(interaction, self.tag_name, amount)
             else:
                 await cog.process_sell(interaction, self.tag_name, amount)
+        else:
+            await interaction.response.send_message("❌ エラー: StocksCogが見つかりません。", ephemeral=True)
 
 class StocksCog(commands.Cog):
     def __init__(self, bot):

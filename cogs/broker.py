@@ -251,7 +251,7 @@ class BrokerCog(commands.Cog):
             await db.commit()
         print("Daily Saturation Decay Applied.")
 
-        return max(multiplier, 0.1)
+
 
     async def get_tag_value_modifier(self, tags):
         # Logarithmic Saturation Decay
