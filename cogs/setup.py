@@ -166,7 +166,7 @@ class SetupCog(commands.Cog):
             
             # Bot Gallery Setup (Same as before)
             if forum:
-                async with aiosqlite.connect(self.bot.bank.db_path) as db:
+                async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
                      cursor = await db.execute("SELECT thread_id FROM user_galleries WHERE user_id = ?", (self.bot.user.id,))
                      row = await cursor.fetchone()
                      if not row:

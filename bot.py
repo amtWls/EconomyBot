@@ -23,6 +23,7 @@ class BankSystem:
 
     async def initialize(self):
         async with aiosqlite.connect(self.db_path, timeout=60.0) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
             # Bank table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS bank (
