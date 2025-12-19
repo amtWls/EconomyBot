@@ -253,7 +253,7 @@ class MarketCog(commands.Cog):
                 await self.bot.bank.withdraw_credits(ctx.author, price)
                 
                 await db.execute(
-                    "UPDATE market_items SET status = 'sold', buyer_id = ? WHERE item_id = ?",
+                    "UPDATE market_items SET status = 'owned', buyer_id = ? WHERE item_id = ?",
                     (ctx.author.id, item_id,)
                 )
                 await db.commit()

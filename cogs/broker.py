@@ -101,7 +101,7 @@ class ResellPriceModal(discord.ui.Modal, title="再販価格の設定"):
             # Re-verify ownership
             cursor = await db.execute("""
                 SELECT thread_id, message_id, tags, aesthetic_score FROM market_items 
-                WHERE item_id = ? AND buyer_id = ? AND status = 'sold'
+                WHERE item_id = ? AND buyer_id = ? AND status IN ('sold', 'owned')
             """, (self.item_id, interaction.user.id))
             row = await cursor.fetchone()
             
@@ -981,7 +981,7 @@ class BrokerCog(commands.Cog):
             cursor = await db.execute("""
                 SELECT item_id, tags, thread_id, aesthetic_score 
                 FROM market_items 
-                WHERE buyer_id = ? AND status = 'sold'
+                WHERE buyer_id = ? AND status IN ('sold', 'owned')
             """, (ctx.author.id,))
             rows = await cursor.fetchall()
             
@@ -1001,7 +1001,7 @@ class BrokerCog(commands.Cog):
             cursor = await db.execute("""
                 SELECT item_id, tags, aesthetic_score 
                 FROM market_items 
-                WHERE buyer_id = ? AND status = 'sold'
+                WHERE buyer_id = ? AND status IN ('sold', 'owned')
                 ORDER BY item_id DESC
             """, (ctx.author.id,))
             rows = await cursor.fetchall()
