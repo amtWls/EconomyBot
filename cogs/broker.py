@@ -15,6 +15,7 @@ import json
 import math
 from datetime import datetime, time, timedelta
 from utils.bloom_filter import BloomFilter
+from utils.valuation import ValuationLogic
 
 class InventoryView(discord.ui.View):
     def __init__(self, ctx, items, per_page=5):
@@ -192,13 +193,16 @@ class BrokerCog(commands.Cog):
         self.tag_data = {} # category: [tags]
         self.load_tag_data()
         
+        self.valuation = ValuationLogic(self.bot.bank.db_path)
+
         # AI Queue System
         self.ai_queue = asyncio.Queue()
         self.ai_worker_task = self.bot.loop.create_task(self.ai_worker())
         
         # Initialize Bloom Filter (Capacity 10000, 0.1% error)
         self.bloom = BloomFilter(capacity=10000, error_rate=0.001)
-        self.bot.loop.create_task(self.initialize_bloom_filter())
+        self.hash_cache = [] # Cache for exact dup check
+        self.bot.loop.create_task(self.initialize_filters())
         
         self.daily_task_loop.start()
 
@@ -234,32 +238,33 @@ class BrokerCog(commands.Cog):
         await self.update_daily_trends()
         await self.decay_saturation()
 
-    async def initialize_bloom_filter(self):
-        """Loads valid image hashes. Tries file first, then DB."""
+    async def initialize_filters(self):
+        """Loads valid image hashes into BloomFilter and MemoryCache."""
         await self.bot.wait_until_ready()
-        print("Initializing Bloom Filter...")
+        print("Initializing Filters...")
         
-        # Try loading from file
+        # Try loading Bloom from file
         loaded_bloom = BloomFilter.load_from_file("bloom_filter.bin")
         if loaded_bloom:
             self.bloom = loaded_bloom
             print(f"Bloom Filter loaded from file. Size eq: {len(self.bloom)}")
-            # Optional: We could load *new* items from DB here if we tracked last_id.
-            # For now, we assume the file is reasonably fresh or we just accept the gap until next save.
-            return
 
         count = 0
         async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            # 1. Load URLs (to prevent re-downloading known links)
             cursor = await db.execute("SELECT image_url, image_hash FROM market_items")
             rows = await cursor.fetchall()
             
             for url, img_hash in rows:
-                if url: self.bloom.add(url)
-                if img_hash: self.bloom.add(img_hash)
+                if not loaded_bloom:
+                    if url: self.bloom.add(url)
+                    if img_hash: self.bloom.add(img_hash)
+
+                if img_hash:
+                    self.hash_cache.append(img_hash)
+
                 count += 1
                 
-        print(f"Bloom Filter Rebuilt with {count} items.")
+        print(f"Filters initialized with {count} items. Hash Cache Size: {len(self.hash_cache)}")
         self.bloom.save_to_file("bloom_filter.bin")
 
     async def ai_worker(self):
@@ -267,8 +272,6 @@ class BrokerCog(commands.Cog):
         print("AI Worker Started.")
         while True:
             try:
-                # task_type: 'tag' or 'score'
-                # future: asyncio.Future to set result
                 task_type, file_path, future = await self.ai_queue.get()
                 
                 try:
@@ -294,19 +297,16 @@ class BrokerCog(commands.Cog):
     @daily_task_loop.before_loop
     async def before_daily_task(self):
         await self.bot.wait_until_ready()
-        # Sleep until 6 AM
         now = datetime.now()
         target = now.replace(hour=6, minute=0, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
-        # For testing, we might want to run immediately if DB is empty, but let's just log.
         print(f"Next Daily Trend Update: {target}")
         await asyncio.sleep((target - now).total_seconds())
 
     async def update_daily_trends(self):
         if not self.tag_data: return
         
-        # Pick 1 from each category
         today_trends = {}
         for category, tags in self.tag_data.items():
             if tags:
@@ -315,8 +315,6 @@ class BrokerCog(commands.Cog):
         date_key = datetime.now().strftime("%Y-%m-%d")
         
         async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            # Clear old trends or just overwrite for the day
-            # We store by date_key just in case
             await db.execute("""
                 INSERT OR REPLACE INTO daily_trends (date_key, pose, costume, body)
                 VALUES (?, ?, ?, ?)
@@ -325,7 +323,6 @@ class BrokerCog(commands.Cog):
         
         print(f"Updated Daily Trends for {date_key}: {today_trends}")
         
-        # Notify "トレンド" channel in all guilds
         embed = discord.Embed(title=f"📅 本日のトレンド ({date_key})", color=discord.Color.gold())
         embed.description = "市場調査の結果、以下の属性が高騰しています！\nこれらの要素を含む画像を密輸するとボーナスがつきます。"
         embed.add_field(name="🤸 ポーズ", value=f"`{today_trends.get('pose')}`", inline=True)
@@ -341,25 +338,9 @@ class BrokerCog(commands.Cog):
                 except Exception as e:
                     print(f"Failed to send trend update to guild {guild.name}: {e}")
 
-    async def get_current_trends(self):
-        date_key = datetime.now().strftime("%Y-%m-%d")
-        async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            cursor = await db.execute("SELECT pose, costume, body FROM daily_trends WHERE date_key = ?", (date_key,))
-            row = await cursor.fetchone()
-            if row:
-                return {'pose': row[0], 'costume': row[1], 'body': row[2]}
-            else:
-                # Force update if missing
-                await self.update_daily_trends()
-                return await self.get_current_trends()
-
     def _run_predict_sync(self, client, file_path):
         """Run prediction in a separate thread"""
-        print(f"DEBUG: Thread Running for {file_path}")
         try:
-             # Try passing path directly first?
-             # Some Gradio apps accept path strings.
-             # If this fails, we catch it.
              return client.predict(handle_file(file_path), api_name="/predict")
         except Exception as e:
              print(f"DEBUG: Prediction Thread Error: {e}")
@@ -373,14 +354,15 @@ class BrokerCog(commands.Cog):
         if not current_hash:
             return 10, "Unknown Error", 0
         
-        async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            cursor = await db.execute("SELECT image_hash FROM market_items WHERE image_hash IS NOT NULL")
-            rows = await cursor.fetchall()
+        # Use Memory Cache instead of DB
+        if not self.hash_cache:
+            return 0, f"✅ **確認完了** (新規アイテム)", 100
 
         current_hash_obj = imagehash.hex_to_hash(current_hash)
         min_dist = 100
         
-        for (db_hash_str,) in rows:
+        # Iterate over memory cache
+        for db_hash_str in self.hash_cache:
             try:
                 db_hash_obj = imagehash.hex_to_hash(db_hash_str)
                 dist = current_hash_obj - db_hash_obj
@@ -412,7 +394,6 @@ class BrokerCog(commands.Cog):
     async def decay_saturation(self):
         """Called daily to reduce saturation."""
         async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            # Decay by 10% or at least 1
             await db.execute("""
                 UPDATE market_trends 
                 SET saturation = CAST(saturation * 0.9 AS INTEGER) 
@@ -421,46 +402,10 @@ class BrokerCog(commands.Cog):
             await db.commit()
         print("Daily Saturation Decay Applied.")
 
-
-
-    async def get_tag_value_modifier(self, tags):
-        # Logarithmic Saturation Decay
-        # Multiplier = 1 / log10(saturation + 2)
-        # Base saturation starts at 0.
-        # If saturation is 100 -> log10(102) ~ 2.0 -> Mult ~ 0.5
-        # If saturation is 500 -> log10(502) ~ 2.7 -> Mult ~ 0.37
-        
-        multiplier = 1.0
-        async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            for tag in tags:
-                cursor = await db.execute("SELECT current_price, saturation FROM market_trends WHERE tag_name = ?", (tag,))
-                row = await cursor.fetchone()
-                
-                if row:
-                    price, sat = row
-                    # Apply saturation penalty
-                    # Use a weighted average or minimum multiplier?
-                    # Let's use the WORST modifier (the most saturated tag pulls down the whole value)
-                    # Or average? Average feels fairer.
-                    
-                    sat_mult = 1.0 / math.log10(max(sat, 0) + 2)
-                    
-                    # Accumulate? Let's average the multipliers of known tags
-                    # But we need to handle "no record" tags as 1.0
-                    # This logic is complex. Simplified:
-                    # Modify the aggregate multiplier by the impact of this tag.
-                    # Let's take the Minimum modifier found.
-                    if sat_mult < multiplier:
-                         multiplier = sat_mult
-        
-        return max(multiplier, 0.1)
-
-
-
     @commands.command(name="trends")
     async def trends(self, ctx):
         """(Beta) 今日の流行トレンドを表示します。"""
-        trends = await self.get_current_trends()
+        trends = await self.valuation.get_current_trends()
         if not trends:
             await ctx.send("📅 今日のトレンドはまだ発表されていません。")
             return
@@ -497,31 +442,20 @@ class BrokerCog(commands.Cog):
         await self.ai_queue.put(('tag', file_path, future))
         
         try:
-            # Enforce 20s timeout
-            res = await asyncio.wait_for(future, timeout=30.0) # Slightly longer to account for queue wait
+            res = await asyncio.wait_for(future, timeout=30.0)
 
-            # Debug output for verification
-            # print(f"DEBUG: Tagger Raw Output Type: {type(res)}")
-            
-            # Helper to parse Gradio Label output
             def parse_gradio_label(data):
                 if isinstance(data, dict) and 'confidences' in data:
                     return {item['label']: item['confidence'] for item in data['confidences']}
                 return data if isinstance(data, dict) else {}
 
-            # Initialize containers
             confidences = {}
             character_confidences = {}
             
-            # Handle Tuple Output (New Tagger Model: [comb_tags_str, rating_dict, char_dict, gen_dict])
             if isinstance(res, (list, tuple)) and len(res) >= 3:
-                # index 2 is character tags
-                # index 3 is general tags
-                
                 if len(res) > 3:
                     confidences = parse_gradio_label(res[3])
                 elif len(res) > 0 and isinstance(res[0], dict):
-                     # Fallback if structure is different
                     confidences = parse_gradio_label(res[0])
 
                 if isinstance(res[2], dict) or (isinstance(res[2], dict) and 'confidences' in res[2]):
@@ -530,17 +464,10 @@ class BrokerCog(commands.Cog):
             elif isinstance(res, dict):
                 confidences = parse_gradio_label(res)
 
-            # Fallback for file path output
-            if isinstance(res, str) and os.path.exists(res):
-                 # This path is legacy/fallback, unlikely to happen with this model
-                 pass
-
             tag_list = []
             character_list = []
 
-            # Process General Tags
             if confidences:
-                # Ensure values are floats
                 clean_confidences = {}
                 for k, v in confidences.items():
                     try:
@@ -551,7 +478,6 @@ class BrokerCog(commands.Cog):
                 sorted_tags = sorted(clean_confidences.items(), key=lambda x: x[1], reverse=True)
                 tag_list = [t[0] for t in sorted_tags if t[1] > 0.35][:20]
 
-            # Process Character Tags
             if character_confidences:
                 clean_chars = {}
                 for k, v in character_confidences.items():
@@ -561,7 +487,7 @@ class BrokerCog(commands.Cog):
                         continue
 
                 sorted_chars = sorted(clean_chars.items(), key=lambda x: x[1], reverse=True)
-                character_list = [c[0] for c in sorted_chars if c[1] > 0.5] # Higher threshold for chars
+                character_list = [c[0] for c in sorted_chars if c[1] > 0.5]
 
             return tag_list, ", ".join(tag_list), character_list
                 
@@ -573,47 +499,6 @@ class BrokerCog(commands.Cog):
             
         return [], "timeout_fallback", []
 
-    async def _fetch_tag_count(self, tag_name):
-        """Fetches post count for a tag from Danbooru (with 30-day DB Cache)."""
-        # 1. Check DB Cache
-        async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            cursor = await db.execute("SELECT post_count, last_updated FROM tag_metadata WHERE tag_name = ?", (tag_name,))
-            row = await cursor.fetchone()
-            
-            if row:
-                count, last_updated_str = row
-                last_updated = datetime.strptime(last_updated_str, "%Y-%m-%d %H:%M:%S")
-                if datetime.now() - last_updated < timedelta(days=30):
-                    return count
-
-        # 2. Fetch from API
-        try:
-            print(f"Fetching count for tag: {tag_name}")
-            async with aiohttp.ClientSession() as session:
-                # Danbooru API: tags.json?search[name]=tag_name
-                url = f"https://danbooru.donmai.us/tags.json"
-                params = {"search[name]": tag_name}
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data and isinstance(data, list):
-                            post_count = data[0].get('post_count', 0)
-                            
-                            # Update Cache
-                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-                                await db.execute(
-                                    "INSERT OR REPLACE INTO tag_metadata (tag_name, post_count, last_updated) VALUES (?, ?, ?)",
-                                    (tag_name, post_count, now_str)
-                                )
-                                await db.commit()
-                            
-                            return post_count
-        except Exception as e:
-            print(f"Danbooru API Error ({tag_name}): {e}")
-            
-        return 9999999 # Return high count (low rarity) on failure
-
     async def _run_scorer(self, file_path):
         """Runs the aesthetic scorer AI via Queue."""
         if not self.ai_client_score: return random.uniform(2.0, 5.0)
@@ -622,104 +507,10 @@ class BrokerCog(commands.Cog):
         await self.ai_queue.put(('score', file_path, future))
         
         try:
-            # Enforce 20s timeout
             res = await asyncio.wait_for(future, timeout=30.0)
             return float(res)
         except:
             return random.uniform(2.0, 5.0)
-
-    async def _calculate_price(self, score, tag_list, character_list):
-        """Calculates final price, trend bonus, and rarity multiplier."""
-        tag_multiplier = await self.get_tag_value_modifier(tag_list)
-        base_price = 1000
-        
-        trends = await self.get_current_trends()
-        trend_bonus = 0
-        matched_trends = []
-        
-        if trends:
-            for cat, val in trends.items():
-                if val and val in tag_list:
-                    trend_bonus += 5000 
-                    matched_trends.append(val)
-        
-        # Character Bonus
-        char_bonus = 0
-        if character_list:
-            char_bonus = 2000 * len(character_list)
-
-        # --- Rarity Bonus (Danbooru) ---
-        rarity_multiplier = 1.0
-        
-        # Filter commonly used tags to avoid dilution
-        ignored_tags = {'1girl', 'solo', 'long_hair', 'breasts', 'looking_at_viewer', 'smile', 'blush', 'short_hair', 'open_mouth'}
-        candidate_tags = [t for t in tag_list if t not in ignored_tags and t not in character_list] # Chars have their own bonus
-        
-        # We need to fetch counts. This can be slow if not cached, so limit to top 5 candidates?
-        # Let's take first 5 from "tag_list" which is sorted by confidence usually? 
-        # Actually tag_list is sorted by confidence.
-        # Let's check top 5 confident tags.
-        check_limit = 5
-        checked_tags = []
-        rarity_scores = []
-        
-        for tag in candidate_tags[:check_limit]:
-             count = await self._fetch_tag_count(tag)
-             # Formula: Multiplier boost based on rarity.
-             # < 1000: x3.0
-             # < 5000: x2.0
-             # < 20000: x1.5
-             # < 50000: x1.2
-             # Else: x1.0
-             
-             mult = 1.0
-             if count < 1000: mult = 3.0
-             elif count < 5000: mult = 2.0
-             elif count < 20000: mult = 1.5
-             elif count < 50000: mult = 1.2
-             
-             rarity_scores.append(mult)
-             if mult > 1.0:
-                 checked_tags.append(f"{tag}({count})")
-
-        if rarity_scores:
-            # Take the MAX rarity found (reward the rarest feature), or average?
-            # Max is better for "Jackpot" feeling.
-            rarity_multiplier = max(rarity_scores)
-
-        # Ensure score is within bounds
-        score = max(0.0, min(10.0, score))
-        
-        # Final Algo: (Base Exponential) * SaturationMult * RarityMult + Trend + Char
-        # New Formula: 1000 * (score^2)
-        base_value_exp = int(1000 * (score ** 2))
-        
-        value_part = int(base_value_exp * tag_multiplier * rarity_multiplier)
-        
-        final_price = value_part + trend_bonus + char_bonus
-
-        # --- Stock Market Influence ---
-        # Trigger async stock update
-        stocks_cog = self.bot.get_cog("StocksCog")
-        if stocks_cog:
-            for tag in tag_list:
-                # User Formula:
-                # 1. Supply (Smuggle): -0.5%
-                change_rate = -0.005
-                
-                # 2. Quality (S-Rank >= 9.0): +2.0% Bonus
-                # (Net result: -0.5% + 2.0% = +1.5%)
-                if score >= 9.0: 
-                    change_rate += 0.02
-                
-                # 3. Trend Bonus (If Applicable - Placeholder for now)
-                # if is_trending(tag): change_rate *= 2
-                
-                multiplier = 1.0 + change_rate
-                
-                self.bot.loop.create_task(stocks_cog.update_stock_price(tag, multiplier))
-
-        return final_price, trend_bonus, matched_trends, char_bonus, rarity_multiplier, checked_tags
 
     @commands.command(name="smuggle")
     async def smuggle(self, ctx):
@@ -736,23 +527,17 @@ class BrokerCog(commands.Cog):
         image_url = attachment.url
         await ctx.send("🕵️ **密輸作戦を開始します...**")
 
-        # 1. Download & Hash
         temp_path, img_hash = await self._download_and_hash(image_url)
         if not temp_path:
             await ctx.send("❌ ダウンロードに失敗しました。")
             return
 
         try:
-            # 2. Bloom Filter Check (Fast Fail)
-            # We check the Bloom Filter FIRST to avoid expensive DB queries for known duplicates.
-            # If check returns True, it's LIKELY a duplicate (proceed to DB to confirm).
-            # If False, it is DEFINITELY unique.
+            # Check Bloom Filter first
             if self.bloom.check(img_hash):
                 print(f"Bloom Filter Warning: Hash {img_hash} might exist.")
             
-            # 3. DB Duplicate Check (Strict & Reliable)
-            # Even if Bloom said "No", we still check DB for *similar* images (hamming distance),
-            # which Bloom Filter cannot do.
+            # Check Memory Cache
             is_dup, dup_msg, _ = await self.get_risk_factor(img_hash)
             
             if is_dup >= 50:
@@ -761,22 +546,24 @@ class BrokerCog(commands.Cog):
 
             await ctx.send(f"✅ **密輸成功!**\n闇市の鑑定人に連絡しています...")
             
-            # 4. AI Valuation
             tag_list, tags_str, character_list = await self._run_tagger(temp_path)
             score = await self._run_scorer(temp_path)
             
-            # Removed score rejection check (< 4.0) to accept all items.
-
-            # 5. Pricing
-            final_price, trend_bonus, matched_trends, char_bonus, rarity_mult, rare_tags = await self._calculate_price(score, tag_list, character_list)
+            final_price, trend_bonus, matched_trends, char_bonus, rarity_mult, rare_tags = await self.valuation.calculate_price(score, tag_list, character_list)
             
-            # 6. Grading
+            # Trigger Stock Update
+            stocks_cog = self.bot.get_cog("StocksCog")
+            if stocks_cog:
+                for tag in tag_list:
+                    change_rate = -0.005
+                    if score >= 9.0: change_rate += 0.02
+                    multiplier = 1.0 + change_rate
+                    self.bot.loop.create_task(stocks_cog.update_stock_price(tag, multiplier))
+
             grade = "B"
             if score >= 9.0: grade = "S"
             elif score >= 7.0: grade = "A"
             
-            # 7. Post to Gallery & DB Insert
-            # 7. Post to Gallery & DB Insert (Atomic)
             item_id = None
             async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
                 cursor = await db.execute(
@@ -787,9 +574,7 @@ class BrokerCog(commands.Cog):
                     (self.bot.user.id, image_url, score, int(final_price * 1.5), img_hash, str(tag_list), grade)
                 )
                 item_id = cursor.lastrowid
-                # Do NOT commit yet
                 
-                # Create Embed
                 embed = discord.Embed(title=f"📦 新規入荷 (ID: #{item_id})", color=discord.Color.purple())
                 embed.set_image(url=image_url)
                 embed.add_field(name="販売者", value=self.bot.user.mention, inline=True)
@@ -806,22 +591,13 @@ class BrokerCog(commands.Cog):
                     embed.add_field(name="🔥 トレンドボーナス!", value=f"+{trend_bonus:,} ({', '.join(matched_trends)})", inline=False)
                 embed.add_field(name="特徴 (Tags)", value=tags_str[:1000], inline=False)
                 
-                # Post Logic & Completion
                 try:
-                    # Pass 'db' to share transaction
                     await self._post_to_gallery(ctx, embed, temp_path, tags_str, item_id, grade, final_price, tag_list, image_url, img_hash, db_conn=db)
-                    
-                    await db.commit() # Commit all changes (Item, Money, Trends)
+                    await db.commit()
                     
                 except Exception as e:
                     await ctx.send(f"❌ 投稿処理中にエラーが発生: {e}")
                     traceback.print_exc()
-                    # Implicit Rollback on exit context manager without commit?
-                    # Actually aiosqlite context manager does commit on exit? 
-                    # No, it *closes*. If we didn't commit, changes are lost? 
-                    # SQLite default is to rollback uncommitted transactions on close. Yes.
-                    # But verifying: aiosqlite context manager for CONNECTION just closes it.
-                    # So uncommitted changes are rolled back. Correct.
                     return
 
         except Exception as e:
@@ -834,7 +610,6 @@ class BrokerCog(commands.Cog):
         """Handles posting to the appropriate thread or forum."""
         bot_thread = None
         
-        # 1. Fetch User Gallery (Using shared conn)
         cursor = await db_conn.execute("SELECT thread_id FROM user_galleries WHERE user_id = ?", (self.bot.user.id,))
         row = await cursor.fetchone()
         if row:
@@ -861,7 +636,6 @@ class BrokerCog(commands.Cog):
         else:
                 forum = discord.utils.get(ctx.guild.forums, name="闇市ギャラリー")
                 if forum:
-                # ... (Same forum logic)
                     title = f"[{grade}] {tags_str[:30]}..." if len(tags_str) > 30 else f"[{grade}] {tags_str}"
                     if not title: title = f"[{grade}] 謎の品"
 
@@ -879,18 +653,18 @@ class BrokerCog(commands.Cog):
                     await ctx.send(f"✅ **密輸成功！(ID: {item_id})**\n臨時スレッドが作成されました: {thread_ref.mention}")
                 else:
                     await ctx.send("❌ フォーラム「闇市ギャラリー」が見つかりません。`!init_server` を確認してください。")
-                    # If we return here, we must raise exception to trigger rollback in caller!
                     raise Exception("Gallery Forum Not Found")
 
-        # DB Updates & Payment (Atomic)
         await self.bot.bank.deposit_credits(ctx.author, final_price, db_conn=db_conn)
         await self.update_market_trends(tag_list, db_conn=db_conn)
         
-        # Update Bloom Filter
         self.bloom.add(image_url)
         self.bloom.add(img_hash)
         
-        # Final Link Update
+        # Add to Cache
+        if img_hash:
+            self.hash_cache.append(img_hash)
+
         await db_conn.execute(
             "UPDATE market_items SET thread_id = ?, message_id = ? WHERE item_id = ?",
             (thread_ref.id, message.id if message else 0, item_id)
@@ -903,7 +677,6 @@ class BrokerCog(commands.Cog):
         """闇のブローカーとして登録し、個人用ギャラリーを開設します。"""
         
         async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
-            # 1. Check if already joined
             cursor = await db.execute("SELECT thread_id FROM user_galleries WHERE user_id = ?", (ctx.author.id,))
             row = await cursor.fetchone()
             
@@ -911,7 +684,6 @@ class BrokerCog(commands.Cog):
                 await ctx.send(f"⚠️ 既に登録済みです。ギャラリー: <#{row[0]}>")
                 return
 
-            # 2. Assign Role & Find Forum
             role = discord.utils.get(ctx.guild.roles, name="密輸業者")
             forum = discord.utils.get(ctx.guild.forums, name="闇市ギャラリー")
             
@@ -925,7 +697,6 @@ class BrokerCog(commands.Cog):
                 except discord.Forbidden:
                     await ctx.send("⚠️ ロールの付与に失敗しました(権限不足)。")
 
-            # 3. Create Gallery Thread
             try:
                 thread_with_message = await forum.create_thread(
                     name=f"[Gallery] {ctx.author.display_name}",
@@ -933,7 +704,6 @@ class BrokerCog(commands.Cog):
                 )
                 thread = thread_with_message.thread if hasattr(thread_with_message, 'thread') else thread_with_message
                 
-                # 4. Save to DB & Give Starting Funds (Atomic)
                 await db.execute("INSERT INTO user_galleries (user_id, thread_id) VALUES (?, ?)", (ctx.author.id, thread.id))
                 await self.bot.bank.deposit_credits(ctx.author, 3000, db_conn=db)
                 
@@ -944,7 +714,6 @@ class BrokerCog(commands.Cog):
             except Exception as e:
                 await ctx.send(f"❌ ギャラリー作成に失敗しました: {e}")
                 traceback.print_exc()
-                # Rollback handled by context manager (no commit)
 
     @commands.command(name="reset_game")
     @commands.has_permissions(administrator=True)
@@ -970,9 +739,11 @@ class BrokerCog(commands.Cog):
                     print(f"Failed to clear {table}: {e}")
             await db.commit()
         
+        # Clear Memory Cache
+        self.hash_cache = []
+        self.bloom = BloomFilter(capacity=10000, error_rate=0.001) # Reset bloom
+
         await ctx.send("🔥 **リセット完了/WIPE COMPLETE**\n全てのデータが削除されました。`!init_server` からやり直してください。")
-
-
 
     @commands.command(name="inventory", aliases=["bag", "inv"])
     async def inventory(self, ctx):
@@ -991,8 +762,6 @@ class BrokerCog(commands.Cog):
 
         view = InventoryView(ctx, rows, per_page=5)
         await ctx.send(embed=view.get_embed(), view=view)
-
-
 
     @commands.command(name="resell")
     async def resell(self, ctx):
@@ -1019,6 +788,7 @@ class BrokerCog(commands.Cog):
         async with aiosqlite.connect(self.bot.bank.db_path, timeout=60.0) as db:
             await db.execute("UPDATE market_items SET image_hash = NULL")
             await db.commit()
+        self.hash_cache = [] # Clear cache
         await ctx.send("🔄 **記憶消去完了。** 当局は押収品に関するデータを失いました。\nこれで再び低リスクで密輸できます！")
 
 async def setup(bot):
