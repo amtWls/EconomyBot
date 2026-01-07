@@ -88,4 +88,55 @@
 
 ---
 
+---
+
+## 🚀 셋업 및 실행 (Setup & Run)
+
+この Bot をローカル環境で実行するための手順です。
+
+### 1. 前提条件 (Prerequisites)
+
+- **Python 3.10+** がインストールされていること
+- **Git** がインストールされていること
+
+### 2. インストール (Installation)
+
+```bash
+# リポジトリのクローン
+git clone https://github.com/your-username/EconomyBot.git
+cd EconomyBot
+
+# 仮想環境の作成と有効化 (推奨)
+python -m venv .venv
+# Windows:
+# .venv\Scripts\activate
+# Mac/Linux:
+source .venv/bin/activate
+
+# 依存ライブラリのインストール
+pip install -r requirements.txt
+```
+
+### 3. 環境設定 (Configuration)
+
+このプロジェクトには環境変数を設定するための `.env` ファイルが必要です。
+`.env.example` ファイルをコピーして `.env` を作成し、必要なトークンを入力してください。
+
+```bash
+cp .env.example .env
+```
+
+`.env` ファイルをテキストエディタで開き、以下の値を設定します：
+
+- `DISCORD_TOKEN`: Discord Developer Portal から取得した Bot トークン
+- `HF_TOKEN`: Hugging Face で取得した Access Token (Read 権限推奨)
+
+### 4. 実行 (Run)
+
+```bash
+python bot.py
+```
+
+---
+
 > _Warning: This bot is currently in Beta. Economy balance is subject to change._
